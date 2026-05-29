@@ -261,20 +261,51 @@ float dead_time = get_interpolated_dead_time(battery_voltage); // Плавный
 total_fuel = (base_fuel * ve_coefficient * warmup_coeff * o2_trim) + dead_time;
 // Режимы отсечек по топливу
 if (rpm >= REV_LIMIT || (tps == 0 && rpm > 1500)) { total_fuel = 0.0f; } // Жесткая отсечка или ПХХ
-// --- ШАГ 7: УПРАВЛЕНИЕ ЖЕЛЕЗОМ (Выдача команд на Таймер и Катушки зажигания) ---
-uint32_t timer_ticks = (uint32_t)(total_fuel * 100.0f); // Перевод в тики таймера (1 мс = 100 тиков)
-__HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, timer_ticks); // Пишем ШИМ форсунки на ножку PA8
-// Логика дублирования форсунок при отказах (Ваша идея аппаратного резерва!)
-int active_injector = (error_registry & ERR_INJECTOR_1) ? 2 : 1;
-// Искра лупит всегда, сжигая остатки пленки и страхуя от взрыва выхлопа катера
-if (current_cylinder_pair == 14) {
-HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET); HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET); // ИСКРА А (PB0)
-HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET);
-}
-else if (current_cylinder_pair == 23) {
-HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET); HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET); // ИСКРА Б (PB1)
-HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET);
-}
+
+// --- ШАГ 7: УПРАВЛЕНИЕ ИСКРОЙ ЗАЖИГАНИЯ С УЧЕТОМ НАКОПЛЕНИЯ (Dwell Time) ---
+    // Нам нужно, чтобы катушка успела зарядиться током перед тем, как выдать искру.
+    // Задаем время накопления энергии для катушек ВАЗ — ровно 3.5 миллисекунды.
+    float dwell_time_ms = 3.5f; 
+
+    // Вычисляем, сколько это будет в тиках нашего микросекундного таймера (1 мс = 100 тиков)
+    uint32_t dwell_ticks = (uint32_t)(dwell_time_ms * 100.0f); // Получаем 350 тиков таймера
+
+    // Проверяем фазу коленвала по ДПКВ
+    if (current_cylinder_pair == 14) { 
+        // --- РАБОТАЕМ С КАТУШКОЙ А (Цилиндры 1 и 4) ---
+
+        // 1. ВКЛЮЧАЕМ НАКОПЛЕНИЕ: Подаем 5В на коммутатор А (ножка PB0). 
+        // Ток пошел в первичную обмотку катушки, начинает расти магнитное поле.
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);   
+
+        // 2. АППАРАТНАЯ ЗАДЕРЖКА: Ждем ровно те самые 3.5 мс, пока катушка полностью "наестся" энергией.
+        // В реальном STM32 этот микро-отсчет сделает сам аппаратный таймер (Output Compare),
+        // но в логике Си-программы это выглядит как точная выдержка времени dwell_ticks.
+        HAL_Delay_us(dwell_ticks * 10); // Микросекундная задержка (3500 мкс)
+
+        // 3. ИСКРА: Мгновенно роняем ножку PB0 в чистый ноль! Ток резко обрывается.
+        // Магнитное поле коллапсирует, и во вторичной обмотке рождается 25 000 Вольт. БУМ! Свечи пробиты!
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET); 
+
+        // Защитная страховка: Катушка Б (ножка PB1) в этот момент гарантированно спит и не греется
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET); 
+    } 
+    else if (current_cylinder_pair == 23) { 
+        // --- РАБОТАЕМ С КАТУШКОЙ Б (Цилиндры 2 и 3) ---
+
+        // Включаем ток накопления для Катушки Б на ножке PB1
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);   
+
+        // Ждем 3.5 миллисекунды (3500 микросекунд) для насыщения обмотки
+        HAL_Delay_us(dwell_ticks * 10); 
+
+        // Обрываем ток на ножке PB1 — БУМ! Мощная искра летит во 2 и 3 цилиндры катера
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET); 
+
+        // Катушка А спит
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET); 
+    }
+
 // --- ШАГ 8: УМНЫЙ OLED ДИСПЛЕЙ КАТЕРА (ПРИБОРКА И ЭКРАН СБОЕВ OBD) ---
 u8g2_ClearBuffer(&u8g2); u8g2_SetFont(&u8g2, u8g2_font_ncenB10_tr);
 if (error_registry == ERR_NONE) {
