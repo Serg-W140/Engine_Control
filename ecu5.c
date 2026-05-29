@@ -27,6 +27,11 @@
 #define ERR_TPS_BROKEN   0x04  // Бит 2: Отказал ДПДЗ положения заслонки ВАЗ
 #define ERR_INJECTOR_1   0x08  // Бит 3: Зафиксирован сбой/обрыв Форсунки №1
 
+// --- ТАРИРОВКА ВРЕМЕНИ НАКОПЛЕНИЯ КАТУШКИ ОТ НАПРЯЖЕНИЯ Бортсети ---
+#define DWELL_POINTS 4
+const float DWELL_VOLT_AXIS[DWELL_POINTS] = {10.0f, 12.0f, 14.0f, 16.0f}; // Напряжение сети в Вольтах
+const float DWELL_TIME_AXIS[DWELL_POINTS] = {5.00f, 3.80f, 3.00f, 2.40f; // Время накопления в миллисекундах
+
 // --- ПАРАМЕТРЫ ФИЗИЧЕСКОГО ЖЕЛЕЗА МОТОРА ---
 const float INJECTOR_FLOW = 150.0f; // Производительность форсунки ВАЗ (куб.см/мин)
 
@@ -153,6 +158,21 @@ void write_error_to_eeprom(uint8_t error_code) {
     HAL_Delay(5); // Пауза для завершения физического цикла записи памяти
 }
 
+// Новая функция: плавно вычисляет время накопления под текущие Вольты сети
+float get_interpolated_dwell_time(float voltage) {
+    if (voltage <= DWELL_VOLT_AXIS[0]) return DWELL_TIME_AXIS[0]; // Меньше 10В -> даем максимум 5 мс
+    if (voltage >= DWELL_VOLT_AXIS[DWELL_POINTS-1]) return DWELL_TIME_AXIS[DWELL_POINTS-1]; // Больше 16В -> зажимаем до 2.4 мс
+
+    for (int i = 0; i < DWELL_POINTS - 1; i++) {
+        if (voltage >= DWELL_VOLT_AXIS[i] && voltage <= DWELL_VOLT_AXIS[i+1]) {
+            // Пропорция линейной интерполяции
+            float factor = (voltage - DWELL_VOLT_AXIS[i]) / (DWELL_VOLT_AXIS[i+1] - DWELL_VOLT_AXIS[i]);
+            return DWELL_TIME_AXIS[i] + factor * (DWELL_TIME_AXIS[i+1] - DWELL_TIME_AXIS[i]);
+        }
+    }
+    return 3.50f; // Резервное значение
+}
+
 int main(void)
 {
   // Автоматические стартовые настройки железа от CubeMX
@@ -262,47 +282,28 @@ total_fuel = (base_fuel * ve_coefficient * warmup_coeff * o2_trim) + dead_time;
 // Режимы отсечек по топливу
 if (rpm >= REV_LIMIT || (tps == 0 && rpm > 1500)) { total_fuel = 0.0f; } // Жесткая отсечка или ПХХ
 
-// --- ШАГ 7: УПРАВЛЕНИЕ ИСКРОЙ ЗАЖИГАНИЯ С УЧЕТОМ НАКОПЛЕНИЯ (Dwell Time) ---
-    // Нам нужно, чтобы катушка успела зарядиться током перед тем, как выдать искру.
-    // Задаем время накопления энергии для катушек ВАЗ — ровно 3.5 миллисекунды.
-    float dwell_time_ms = 3.5f; 
+// --- ОБНОВЛЕННЫЙ ШАГ 7: УПРАВЛЕНИЕ ИСКРОЙ С ДИНАМИЧЕСКИМ НАКОПЛЕНИЕМ ---
+    
+    // 1. Проверяем напряжение сети через наш вольтметр и плавно рассчитываем идеальное время накопления!
+    // Если в сети 10.5В (крутим стартер) — функция вернет около 4.5 мс. Если 14.2В (идем на глиссере) — вернет около 2.9 мс.
+    float current_dwell_ms = get_interpolated_dwell_time(battery_voltage); 
 
-    // Вычисляем, сколько это будет в тиках нашего микросекундного таймера (1 мс = 100 тиков)
-    uint32_t dwell_ticks = (uint32_t)(dwell_time_ms * 100.0f); // Получаем 350 тиков таймера
+    // 2. Переводим миллисекунды в микросекундные тики таймера (1 мс = 100 тиков)
+    uint32_t dwell_ticks = (uint32_t)(current_dwell_ms * 100.0f); 
 
     // Проверяем фазу коленвала по ДПКВ
     if (current_cylinder_pair == 14) { 
-        // --- РАБОТАЕМ С КАТУШКОЙ А (Цилиндры 1 и 4) ---
-
-        // 1. ВКЛЮЧАЕМ НАКОПЛЕНИЕ: Подаем 5В на коммутатор А (ножка PB0). 
-        // Ток пошел в первичную обмотку катушки, начинает расти магнитное поле.
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);   
-
-        // 2. АППАРАТНАЯ ЗАДЕРЖКА: Ждем ровно те самые 3.5 мс, пока катушка полностью "наестся" энергией.
-        // В реальном STM32 этот микро-отсчет сделает сам аппаратный таймер (Output Compare),
-        // но в логике Си-программы это выглядит как точная выдержка времени dwell_ticks.
-        HAL_Delay_us(dwell_ticks * 10); // Микросекундная задержка (3500 мкс)
-
-        // 3. ИСКРА: Мгновенно роняем ножку PB0 в чистый ноль! Ток резко обрывается.
-        // Магнитное поле коллапсирует, и во вторичной обмотке рождается 25 000 Вольт. БУМ! Свечи пробиты!
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET); 
-
-        // Защитная страховка: Катушка Б (ножка PB1) в этот момент гарантированно спит и не греется
+        // --- КАТУШКА А (Цилиндры 1 и 4) ---
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_SET);   // Подали ток в коммутатор А
+        HAL_Delay_us(dwell_ticks * 10);                       // Выдерживаем строго рассчитанное время накопления
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET); // БУМ! Искра идеальной мощности!
         HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET); 
     } 
     else if (current_cylinder_pair == 23) { 
-        // --- РАБОТАЕМ С КАТУШКОЙ Б (Цилиндры 2 и 3) ---
-
-        // Включаем ток накопления для Катушки Б на ножке PB1
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);   
-
-        // Ждем 3.5 миллисекунды (3500 микросекунд) для насыщения обмотки
-        HAL_Delay_us(dwell_ticks * 10); 
-
-        // Обрываем ток на ножке PB1 — БУМ! Мощная искра летит во 2 и 3 цилиндры катера
-        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET); 
-
-        // Катушка А спит
+        // --- КАТУШКА Б (Цилиндры 2 и 3) ---
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_SET);   // Подали ток в коммутатор Б
+        HAL_Delay_us(dwell_ticks * 10);                       // Выдерживаем время накопления
+        HAL_GPIO_WritePin(GPIOB, GPIO_PIN_1, GPIO_PIN_RESET); // БУМ! Искра идеальной мощности!
         HAL_GPIO_WritePin(GPIOB, GPIO_PIN_0, GPIO_PIN_RESET); 
     }
 
