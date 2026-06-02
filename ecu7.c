@@ -71,7 +71,11 @@ const float IGN_MAP[MAP_RPM_SIZE][MAP_LOAD_SIZE] = {
 volatile uint16_t adc_raw_buffer[7]; 
 u8g2_t u8g2;                  
 
-int rpm = 800; int current_cylinder_pair = 14; 
+volatile int rpm = 0;                     // Переменная оборотов (теперь она обновляется сама)
+volatile uint32_t last_rpm_tick = 0;      // Время предыдущего импульса ВМТ
+volatile uint32_t rpm_timeout_counter = 0;// Счетчик для определения того, что мотор заглох
+
+int current_cylinder_pair = 14; 
 int p_manifold = 40; int p_ambient = 100; int p_delta = 60; 
 int tps = 0; int temperature = 80; float battery_voltage = 14.0f;
 
@@ -195,6 +199,12 @@ int main(void)
 
   while (1)
   {
+
+     // БЕЗОПАСНОСТЬ: Если импульсов нет больше 200 мс — значит мотор заглох или выключен
+    if (HAL_GetTick() - last_rpm_tick > 200) {
+        rpm = 0;
+    }
+
     // --- ШАГ 1: СБОР ДАННЫХ ИЗ ОПЕРАТИВКИ ---
     uint16_t adc_dad_manifold = adc_raw_buffer[0]; 
     uint16_t adc_dad_ambient  = adc_raw_buffer[1]; 
@@ -367,3 +377,35 @@ HAL_IWDG_Refresh(&hiwdg);
 // ИСПРАВЛЕНО: Убрана жесткая задержка HAL_Delay(100), цикл работает на максимальной скорости
     }
 }
+    // Прерывание вызывается внешней схемой в момент, когда коленвал доходит до расчетного угла НАЧАЛА заряда (charge_angle)
+void HAL_GPIO_EXTI_Callback(uint16_t GPIO_Pin)
+{
+    // 1. ПРЕРЫВАНИЕ ДЛЯ ИСКРЫ (Ваш Шаг 7, реагирует на PIN 0)
+    if (GPIO_Pin == GPIO_PIN_0) 
+    {
+        uint32_t dwell_ticks = (uint32_t)(get_interpolated_dwell_time(battery_voltage) * 1000.0f);
+        __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, dwell_ticks);
+        __HAL_TIM_SET_AUTORELOAD(&htim2, dwell_ticks + 10); 
+
+        if (current_cylinder_pair == 14) {
+            HAL_TIM_OnePulse_Start(&htim2, TIM_CHANNEL_1); 
+        } else if (current_cylinder_pair == 23) {
+            HAL_TIM_OnePulse_Start(&htim2, TIM_CHANNEL_2); 
+        }
+    }
+    
+    // 2. ВОТ ЭТОТ КУСОК ДОБАВЛЯЕМ: ПРЕРЫВАНИЕ ДЛЯ РАСЧЕТА ОБОРОТОВ (Реагирует на PIN 2)
+    else if (GPIO_Pin == GPIO_PIN_2) 
+    {
+        uint32_t current_tick = HAL_GetTick(); // Получаем текущее время в миллисекундах
+        uint32_t period = current_tick - last_rpm_tick; // Считаем, сколько мс прошло с прошлого оборота
+        
+        if (period > 0) // Защита от деления на ноль
+        {
+            // Формула: в 1 минуте = 60 000 миллисекунд. Делим на период одного оборота.
+            rpm = 60000 / period; 
+        }
+        
+        last_rpm_tick = current_tick; // Запоминаем время этого импульса для следующего круга
+    }
+} // Конец файла
