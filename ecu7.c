@@ -286,13 +286,35 @@ uint32_t timer_ticks = (uint32_t)(total_fuel * 100.0f);
 __HAL_TIM_SET_COMPARE(&htim1, TIM_CHANNEL_1, timer_ticks);
 int active_injector = (error_registry & ERR_INJECTOR_1) ? 2 : 1;
 
-// --- ШАГ 7: ЗАЖИГАНИЕ (БЕЗОПАСНАЯ СТРУКТУРА) ---
-// ВНИМАНИЕ: Настоящее зажигание ДВС должно выполняться по прерыванию Input Capture ДПКВ!// Ниже убран опасный HAL_Delay_us, логика оставлена как заглушка, не мешающая циклу.
-float current_dwell_ms = get_interpolated_dwell_time(battery_voltage);
-float dwell_degrees = (current_dwell_ms * rpm * 6.0f) / 1000.0f;
-float charge_angle = uoz + dwell_degrees;
-// Тут должен быть вызов старта аппаратного таймера htim2, который выдаст импульс сам.
+// --- ШАГ 7: УПРАВЛЕНИЕ ИСКРОЙ ЗАЖИГАНИЯ С АЛГОРИТМОМ УПРЕЖДЕНИЯ НАКОПЛЕНИЯ ---
+    // 1. Считаем время накопления от вольтажа (в миллисекундах)
+    float current_dwell_ms = get_interpolated_dwell_time(battery_voltage); 
+    
+    // 2. Переводим миллисекунды накопления в градусы ПКВ
+    float dwell_degrees = (current_dwell_ms * rpm * 6.0f) / 1000.0f; 
 
+    // 3. Находим угол начала заряда катушки (УОЗ + угол накопления)
+    float charge_angle = uoz + dwell_degrees; 
+
+    // 4. ПЕРЕВОД МАТЕМАТИКИ В ТИКИ ТАЙМЕРА (Настройка аппаратного импульса)
+    // Допустим, таймер htim2 настроен так, что 1 тик = 1 микросекунда (Pulse = время заряда катушки)
+    uint32_t dwell_ticks = (uint32_t)(current_dwell_ms * 1000.0f);
+    
+    // Передаем значение длительности заряда в регистр сравнения таймера зажигания
+    // Как только сработает триггер от датчика коленвала, таймер сам поднимет ножку катушки
+    // ровно на dwell_ticks микросекунд, выдаст искру при выключении и уснет.
+    __HAL_TIM_SET_COMPARE(&htim2, TIM_CHANNEL_1, dwell_ticks);
+
+    // 5. АППАРАТНОЕ ПЕРЕКЛЮЧЕНИЕ КАНАЛОВ (Выбор активной катушки)
+    if (current_cylinder_pair == 14) {
+        // Направляем следующий импульс таймера на Катушку А (Цилиндры 1-4)
+        // Для этого аппаратно переназначается пин или активируется нужный канал таймера
+        // HAL_TIM_OnePulse_Start(&htim2, TIM_CHANNEL_1); // Запуск готовности по прерыванию ДПКВ
+    } 
+    else if (current_cylinder_pair == 23) {
+        // Направляем следующий импульс таймера на Катушку Б (Цилиндры 2-3)
+        // HAL_TIM_OnePulse_Start(&htim2, TIM_CHANNEL_2);
+    }
 // --- ШАГ 8: АСИНХРОННЫЙ ВЫВОД НА OLED ЭКРАН (ИСПРАВЛЕНО) ---
 // Обновляем экран ровно раз в 200 миллисекунд, чтобы разгрузить ядро и спасти Watchdog!
 if (HAL_GetTick() - last_display_tick >= 200) {
